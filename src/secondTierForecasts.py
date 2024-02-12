@@ -24,6 +24,10 @@ from keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
 from keras.models import load_model, save_model
 from keras.layers import RepeatVector
 
+from mapie.metrics import regression_coverage_score
+from mapie.regression import MapieRegressor
+from MapieWrapper import TensorflowToMapie
+
 import json5 as json
 
 import common
@@ -177,6 +181,7 @@ def runSecondTier(configFileName, cefType, loadFromSavedModel):
         for exptNum in range(NUMBER_OF_EXPERIMENTS):
             print("Iteration: ", exptNum)
             regionDailyMape = {}
+            # bestModel returned is now a Mapie model
             bestModel, numFeaturesInTraining = trainingandValidationPhase(region, trainData, wTrainData, 
                                             valData, wValData, secondTierConfig, exptNum, loadFromSavedModel)            
             history = valData[-TRAINING_WINDOW_HOURS:, :]
@@ -185,12 +190,19 @@ def runSecondTier(configFileName, cefType, loadFromSavedModel):
             print("weatherData shape:", weatherData.shape)
             history = history.tolist()
             
-            predictedData = getDayAheadForecasts(bestModel, history, testData, 
+            predictedData, probIntervals = getDayAheadForecasts(bestModel, history, testData, 
                                 TRAINING_WINDOW_HOURS, numFeaturesInTraining, DEPENDENT_VARIABLE_COL,
                                 wFtMin[5:], wFtMax[5:], ftMin[DEPENDENT_VARIABLE_COL], ftMax[DEPENDENT_VARIABLE_COL],
                                 wTestData, weatherData, forecastDataset.columns.values[:numForecastFeatures])
             print("***** Forecast done *****")
 
+            with open("../data/prob_intervals/"+region+".txt", "w") as f:
+                for item in probIntervals:
+                    f.writelines(str(item))
+                    f.write("\n")
+            print("Wrote probability intervals to file")
+
+            print("Probability INTERVALS: ", probIntervals)
             unscaledTestData, unscaledPredictedData, formattedTestDates, rmseScore, mapeScore, dailyMapeScore = getUnscaledForecastsAndForecastAccuracy(
                                                                         testData, testDates, predictedData, 
                                                                         ftMin, ftMax)
@@ -504,7 +516,8 @@ def trainModel(trainX, trainY, valX, valY, hyperParams, iteration, region, loadF
         bestModel = load_model(SAVED_MODEL_LOCATION+region+"/"+region+".h5")
         return bestModel, n_features
 
-    epochs = hyperParams["epoch"]    
+    # epochs = hyperParams["epoch"]  
+    epochs = 5
     batchSize = hyperParams["batchsize"]
     activationFunc = hyperParams["actv"]
     lossFunc = hyperParams["loss"]
@@ -548,7 +561,17 @@ def trainModel(trainX, trainY, valX, valY, hyperParams, iteration, region, loadF
     # showModelSummary(hist, bestModel, "CNN")
     # print("Training the best model...")
     # hist = bestModel.fit(trainX, trainY, epochs=100, batch_size=trainParameters['batchsize'], verbose=verbose)
-    return bestModel, n_features
+    
+    # wrapper to be MAPIE-compatible
+    wrapped_best_model = TensorflowToMapie(bestModel)
+    # set to prefit (already trained)
+    mapie_model = MapieRegressor(estimator=wrapped_best_model, method="base", cv="prefit")
+    # TODO - split into training and calibration separately, right now calibrating model on 
+    # training data, risk overfitting?
+    trainY_first = trainY[:, 0] # hack - only return first hour right now
+    mapie_model.fit(trainX, trainY_first)
+    
+    return mapie_model, n_features
 
 def showModelSummary(history, model, architecture=None):
     print("Showing model summary...")
@@ -571,29 +594,35 @@ def getDayAheadForecasts(model, history, testData,
     print("Testing (day ahead forecasts)...")
     # print(ciMin, ciMax)
     predictions = list()
+    probIntervals = list()
     weatherIdx = 0
     avgTimeToForecast = 0
     for i in range(0, ((len(testData)//24)-(BUFFER_HOURS//24))):
         beforeForecast = dt.now()
         dayAheadPredictions = list()
+        dayAheadPIs = list()
         # predict n days, 1 day at a time
         tempHistory = history.copy()
         currentDayHours = i* MODEL_SLIDING_WINDOW_LEN
         for j in range(0, MAX_PREDICTION_WINDOW_HOURS, 24):
             if (j >= PREDICTION_WINDOW_HOURS):
                 continue
-            yhat_sequence, _ = getForecasts(model, tempHistory, 
+            yhat_sequence, y_pis, _ = getForecasts(model, tempHistory, 
                             trainWindowHours, numFeatures, weatherData[j:j+24])
-            dayAheadPredictions.extend(yhat_sequence)
+            # only for first hour right now
+            print("IN getDayAheadForecasts ", yhat_sequence, "y_pis", y_pis)
+            dayAheadPredictions.extend([yhat_sequence])
+            dayAheadPIs.extend(y_pis)
             # add current prediction to history for predicting the next day
-            latestHistory = testData[currentDayHours+j:currentDayHours+j+24, :].tolist()
-            for k in range(24):
-                latestHistory[k][depVarColumn] = yhat_sequence[k]
-            tempHistory.extend(latestHistory)
+            # latestHistory = testData[currentDayHours+j:currentDayHours+j+24, :].tolist()
+            # for k in range(24):
+            #     latestHistory[k][depVarColumn] = yhat_sequence[k]
+            # tempHistory.extend(latestHistory)
         # get real observation and add to history for predicting the next day
         
         history.extend(testData[currentDayHours:currentDayHours+MODEL_SLIDING_WINDOW_LEN, :].tolist())
         predictions.append(dayAheadPredictions)
+        probIntervals.append(dayAheadPIs)
         weatherData = wTestData[weatherIdx:weatherIdx+MAX_PREDICTION_WINDOW_HOURS, :]
         weatherIdx += MAX_PREDICTION_WINDOW_HOURS
         afterForecast = dt.now()
@@ -606,7 +635,8 @@ def getDayAheadForecasts(model, history, testData,
 
     # evaluate predictions days for each day
     predictedData = np.array(predictions, dtype=np.float64)
-    return predictedData
+    probIntervalsData =  np.array(probIntervals, dtype=np.float64)
+    return predictedData, probIntervalsData
 
 def getCIForecastsInRealTime(model, history, testData, numFeatures, 
                    wTestData = None, weatherData = None):
@@ -637,7 +667,7 @@ def getCIForecastsInRealTime(model, history, testData, numFeatures,
     predictedData = np.array(predictions, dtype=np.float64)
     return predictedData
 
-def getForecasts(model, history, trainWindowHours, numFeatures, weatherData):
+def getForecasts(model, history, trainWindowHours, numFeatures, weatherData, alpha=0.1):
     # flatten data
     data = np.array(history, dtype=np.float64)
     # retrieve last observations for input data
@@ -645,10 +675,10 @@ def getForecasts(model, history, trainWindowHours, numFeatures, weatherData):
     input_x = np.append(input_x, weatherData, axis=1)
     # reshape into [1, n_input, num_features]
     input_x = input_x.reshape((1, len(input_x), numFeatures))
-    yhat = model.predict(input_x, verbose=0)
+    yhat, y_pis = model.predict(input_x, alpha=0.5)
     # we only want the vector forecast
-    yhat = yhat[0]
-    return yhat, input_x
+    # yhat = yhat[0]
+    return yhat, y_pis, input_x
 
 def getForecastsInRealTime(model, history, numFeatures, weatherData):
     # flatten data
